@@ -15,11 +15,19 @@ Shader "Lilithe/ORME-Standard-Shader"
         [Toggle(_USE_HEIGHTMAP)] _UseHeightMap ("Use Height Map", Float) = 1
         _ParallaxMap ("Height Map", 2D) = "black" {}
         [Toggle] _InvertHeightMap ("Invert Height Map", Float) = 1
+        _ParallaxSampleRect ("Height Sample Rect (MinX,MinY,MaxX,MaxY)", Vector) = (0,0,1,1)
         _Parallax ("Height Strength", Range(0,0.1)) = 0.02
         _POMMinLayers ("POM Min Layers", Range(4,32)) = 10
         _POMMaxLayers ("POM Max Layers", Range(8,64)) = 28
+        [Toggle] _UseSPOM ("Use SPOM (Silhouette POM)", Float) = 1
+        [Toggle] _UseSilhouetteClipping ("SPOM UV Silhouette Clipping", Float) = 1
+        [Toggle] _UseCurvedSilhouette ("SPOM Curved Silhouette", Float) = 1
+        _HorizonSafeThreshold ("SPOM Horizon Safe Threshold", Range(0.01,1)) = 0.25
+        _HorizonFalloffPower ("SPOM Horizon Falloff Power", Range(0.25,8)) = 2.0
+        _HorizonClipStrength ("SPOM Horizon Clip Strength", Range(0,1)) = 0.4
+        _HorizonHeightBias ("SPOM Horizon Height Bias", Range(-1,1)) = 0.0
         [Toggle] _UseORME ("Use ORME Map", Float) = 1
-        _ORMEMap ("ORME (R=Occlusion G=Roughness B=Metallic A=Emission)", 2D) = "black" {}
+        _ORMEMap ("ORME (R=Occlusion G=Roughness B=Metallic A=Emission)", 2D) = "white" {}
         _OcclusionStrength ("Occlusion Strength", Range(0,1)) = 1.0
         _Glossiness ("Smoothness", Range(0,1)) = 0.5
         _Metallic ("Metallic", Range(0,1)) = 0.0
@@ -57,10 +65,20 @@ Shader "Lilithe/ORME-Standard-Shader"
             #define ORME_DISABLE_POM 0
         #endif
 
+        #if (ORME_LOW_TIER_GLES == 1) || (ORME_DISABLE_POM == 1)
+            #define ORME_DISABLE_SPOM 1
+        #else
+            #define ORME_DISABLE_SPOM 0
+        #endif
+
         sampler2D _MainTex;
         sampler2D _BumpMap;
         sampler2D _ParallaxMap;
         sampler2D _ORMEMap;
+        float4 _MainTex_TexelSize;
+        float4 _BumpMap_TexelSize;
+        float4 _ParallaxMap_TexelSize;
+        float4 _ORMEMap_TexelSize;
 
         struct Input
         {
@@ -78,8 +96,16 @@ Shader "Lilithe/ORME-Standard-Shader"
         half _BumpScale;
         half _Parallax;
         half _InvertHeightMap;
+        float4 _ParallaxSampleRect;
         half _POMMinLayers;
         half _POMMaxLayers;
+        half _UseSPOM;
+        half _UseSilhouetteClipping;
+        half _UseCurvedSilhouette;
+        half _HorizonSafeThreshold;
+        half _HorizonFalloffPower;
+        half _HorizonClipStrength;
+        half _HorizonHeightBias;
         half _OcclusionStrength;
         half _Glossiness;
         half _Metallic;
@@ -102,14 +128,54 @@ Shader "Lilithe/ORME-Standard-Shader"
             return frac((p3.x + p3.y) * p3.z);
         }
 
-        half SampleHeightMap(float2 uv)
+        float2 ORME_WrapUVToSTRect(float2 uv, float2 scale, float2 offset)
         {
-            half height = tex2D(_ParallaxMap, frac(uv)).r;
+            float2 signScale = float2(scale.x < 0.0 ? -1.0 : 1.0, scale.y < 0.0 ? -1.0 : 1.0);
+            float2 safeScale = max(abs(scale), 1e-5.xx) * signScale;
+            float2 localUV = frac((uv - offset) / safeScale);
+            return localUV * safeScale + offset;
+        }
+
+        float2 ORME_ClampUVToRect(float2 uv, float4 rect)
+        {
+            float2 rectMin = min(rect.xy, rect.zw);
+            float2 rectMax = max(rect.xy, rect.zw);
+            return clamp(uv, rectMin, rectMax);
+        }
+
+        float2 ORME_ClampUVToRectInset(float2 uv, float4 rect, float2 texelSize)
+        {
+            float2 rectMin = min(rect.xy, rect.zw);
+            float2 rectMax = max(rect.xy, rect.zw);
+            float2 inset = abs(texelSize) * 0.5;
+            rectMin = min(rectMin + inset, rectMax);
+            rectMax = max(rectMax - inset, rectMin);
+            return clamp(uv, rectMin, rectMax);
+        }
+
+        half ORME_IsUVInsideRectInset(float2 uv, float4 rect, float2 texelSize)
+        {
+            float2 rectMin = min(rect.xy, rect.zw);
+            float2 rectMax = max(rect.xy, rect.zw);
+            float2 inset = abs(texelSize) * 0.5;
+            rectMin = min(rectMin + inset, rectMax);
+            rectMax = max(rectMax - inset, rectMin);
+
+            return step(rectMin.x, uv.x)
+                * step(rectMin.y, uv.y)
+                * step(uv.x, rectMax.x)
+                * step(uv.y, rectMax.y);
+        }
+
+        half SampleHeightMap(float2 uv, float4 sampleRect)
+        {
+            float2 clampedUV = ORME_ClampUVToRect(uv, sampleRect);
+            half height = tex2D(_ParallaxMap, clampedUV).r;
             return lerp(height, 1.0h - height, saturate(_InvertHeightMap));
         }
 
         // POM UV ray marching in tangent space. Uses per-eye view direction, so it remains stable in stereo.
-        float2 ComputePOMOffset(float2 uv, float3 viewDirTS, half heightScale)
+        float2 ComputePOMOffset(float2 uv, float3 viewDirTS, half heightScale, float4 sampleRect)
         {
             viewDirTS = normalize(viewDirTS);
 
@@ -120,7 +186,7 @@ Shader "Lilithe/ORME-Standard-Shader"
             float layerCount = lerp(maxLayers, minLayers, ndotv);
             float layerDepth = rcp(layerCount);
 
-            float2 rayStep = (viewDirTS.xy / max(0.05, abs(viewDirTS.z))) * heightScale;
+            float2 rayStep = (-viewDirTS.xy / max(0.05, abs(viewDirTS.z))) * heightScale;
             float2 deltaUV = rayStep * layerDepth;
 
             float2 currentUV = uv;
@@ -128,7 +194,7 @@ Shader "Lilithe/ORME-Standard-Shader"
             float jitter = Hash12(uv * 4096.0);
             float currentLayerDepth = jitter * layerDepth;
             currentUV -= deltaUV * jitter;
-            float currentHeight = SampleHeightMap(currentUV);
+            float currentHeight = SampleHeightMap(currentUV, sampleRect);
 
             [loop]
             for (int step = 0; step < 64; ++step)
@@ -138,12 +204,12 @@ Shader "Lilithe/ORME-Standard-Shader"
 
                 currentUV -= deltaUV;
                 currentLayerDepth += layerDepth;
-                currentHeight = SampleHeightMap(currentUV);
+                currentHeight = SampleHeightMap(currentUV, sampleRect);
             }
 
             float2 prevUV = currentUV + deltaUV;
             float prevLayerDepth = currentLayerDepth - layerDepth;
-            float prevHeight = SampleHeightMap(prevUV);
+            float prevHeight = SampleHeightMap(prevUV, sampleRect);
 
             float2 aboveUV = prevUV;
             float aboveLayerDepth = prevLayerDepth;
@@ -159,7 +225,7 @@ Shader "Lilithe/ORME-Standard-Shader"
             {
                 float2 midUV = (aboveUV + belowUV) * 0.5;
                 float midLayerDepth = (aboveLayerDepth + belowLayerDepth) * 0.5;
-                float midHeight = SampleHeightMap(midUV);
+                float midHeight = SampleHeightMap(midUV, sampleRect);
 
                 if (midLayerDepth < midHeight)
                 {
@@ -183,10 +249,45 @@ Shader "Lilithe/ORME-Standard-Shader"
             return hitUV - uv;
         }
 
+        void ComputeSPOMOffsetAndVisibility(
+            float2 uv,
+            float3 viewDirTS,
+            float3 worldNormal,
+            float3 worldViewDir,
+            half heightScale,
+            float4 sampleRect,
+            out float2 parallaxOffset,
+            out half silhouetteVisibility)
+        {
+            float2 hitUV = uv + ComputePOMOffset(uv, viewDirTS, heightScale, sampleRect);
+            parallaxOffset = hitUV - uv;
+            silhouetteVisibility = 1.0h;
+
+            if (_UseSilhouetteClipping > 0.5h)
+            {
+                silhouetteVisibility *= ORME_IsUVInsideRectInset(hitUV, sampleRect, _ParallaxMap_TexelSize.xy);
+            }
+
+            if (_UseCurvedSilhouette > 0.5h)
+            {
+                float ndotv = abs(dot(normalize(worldNormal), normalize(worldViewDir)));
+                float t = saturate(1.0 - ndotv / max(_HorizonSafeThreshold, 1e-3h));
+                float horizonFactor = pow(t, max(_HorizonFalloffPower, 1e-3h));
+                float heightThreshold = saturate(horizonFactor * saturate(_HorizonClipStrength));
+                float surfaceHeight = SampleHeightMap(hitUV, sampleRect) - _HorizonHeightBias;
+
+                if (surfaceHeight < heightThreshold)
+                {
+                    silhouetteVisibility = 0.0h;
+                }
+            }
+        }
+
         void surf (Input IN, inout SurfaceOutputStandard o)
         {
             fixed4 c;
             fixed4 orme;
+            half parallaxVisibility = 1.0h;
 
             #if defined(_USE_TRIPLANAR)
                 // Triplanar mapping: project textures from all three world-space axes
@@ -229,21 +330,53 @@ Shader "Lilithe/ORME-Standard-Shader"
             #else
                 // Standard UV-based path with optional parallax.
                 float2 parallaxOffset = float2(0.0, 0.0);
+                float4 sampleRect = saturate(_ParallaxSampleRect);
+                half hasParallax = 0.0h;
 
                 #if defined(_USE_HEIGHTMAP) && (ORME_LOW_TIER_GLES == 0)
                     half3 viewDirTS = normalize(IN.viewDir);
-                    #if (ORME_DISABLE_POM == 0)
-                        parallaxOffset = ComputePOMOffset(frac(IN.uv_ParallaxMap), viewDirTS, _Parallax);
+                    hasParallax = 1.0h;
+                    #if (ORME_DISABLE_SPOM == 0)
+                        if (_UseSPOM > 0.5h)
+                        {
+                            half spomVisibility;
+                            ComputeSPOMOffsetAndVisibility(
+                                IN.uv_ParallaxMap,
+                                viewDirTS,
+                                IN.worldNormal,
+                                (_WorldSpaceCameraPos.xyz - IN.worldPos),
+                                _Parallax,
+                                sampleRect,
+                                parallaxOffset,
+                                spomVisibility);
+                            parallaxVisibility *= spomVisibility;
+                        }
+                        else
+                        {
+                            half heightSample = SampleHeightMap(IN.uv_ParallaxMap, sampleRect);
+                            parallaxOffset = ParallaxOffset(heightSample, _Parallax, float3(-viewDirTS.xy, viewDirTS.z));
+                        }
                     #else
-                        half heightSample = SampleHeightMap(IN.uv_ParallaxMap);
-                        parallaxOffset = ParallaxOffset(heightSample, _Parallax, viewDirTS);
+                        half heightSample = SampleHeightMap(IN.uv_ParallaxMap, sampleRect);
+                        parallaxOffset = ParallaxOffset(heightSample, _Parallax, float3(-viewDirTS.xy, viewDirTS.z));
                     #endif
                 #endif
 
-                // Wrap after parallax so UVs crossing 1.0 continue from 0.0.
-                float2 uvMain   = frac(IN.uv_MainTex   + parallaxOffset);
-                float2 uvNormal = frac(IN.uv_BumpMap   + parallaxOffset);
-                float2 uvORME   = frac(IN.uv_ORMEMap   + parallaxOffset);
+                // Wrap each map inside its own tiled/offset UV rectangle (atlas-safe wrapping).
+                float2 uvMainBase   = ORME_WrapUVToSTRect(IN.uv_MainTex + parallaxOffset, float2(1.0, 1.0), float2(0.0, 0.0));
+                float2 uvNormalBase = ORME_WrapUVToSTRect(IN.uv_BumpMap + parallaxOffset, float2(1.0, 1.0), float2(0.0, 0.0));
+                float2 uvORMEBase   = ORME_WrapUVToSTRect(IN.uv_ORMEMap + parallaxOffset, float2(1.0, 1.0), float2(0.0, 0.0));
+
+                if (hasParallax > 0.5h)
+                {
+                    // Discard displaced fragments that leave the intended atlas island.
+                    parallaxVisibility *= ORME_IsUVInsideRectInset(uvMainBase, sampleRect, _MainTex_TexelSize.xy)
+                        * ORME_IsUVInsideRectInset(uvORMEBase, sampleRect, _ORMEMap_TexelSize.xy);
+                }
+
+                float2 uvMain   = ORME_ClampUVToRectInset(uvMainBase, sampleRect, _MainTex_TexelSize.xy);
+                float2 uvNormal = ORME_ClampUVToRectInset(uvNormalBase, sampleRect, _BumpMap_TexelSize.xy);
+                float2 uvORME   = ORME_ClampUVToRectInset(uvORMEBase, sampleRect, _ORMEMap_TexelSize.xy);
 
                 // Albedo comes from a texture tinted by color
                 c    = tex2D(_MainTex,  uvMain) * _Color;
@@ -268,8 +401,13 @@ Shader "Lilithe/ORME-Standard-Shader"
             o.Metallic   = lerp(_Metallic,   mapMetallic   * _Metallic,   useORME);
             o.Smoothness = lerp(_Glossiness, mapSmoothness * _Glossiness, useORME);
             o.Occlusion  = lerp(1.0h,        mapOcclusion,                useORME);
-            o.Emission   = _EmissionColor.rgb * (orme.a * useORME);
+            // Keep emission map color/contrast, using emissive color mainly as intensity.
+            half emissionMask = orme.a * useORME;
+            half emissionIntensity = max(_EmissionColor.r, max(_EmissionColor.g, _EmissionColor.b));
+            half3 emissionTint = lerp(half3(1.0h, 1.0h, 1.0h), saturate(_EmissionColor.rgb / max(emissionIntensity, 1e-4h)), 0.25h);
+            o.Emission   = c.rgb * emissionMask * emissionIntensity * emissionTint;
             o.Alpha      = c.a;
+            clip(parallaxVisibility - 0.5h);
         }
         ENDCG
     }

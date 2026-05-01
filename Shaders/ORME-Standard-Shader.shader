@@ -7,6 +7,7 @@ Shader "Lilithe/ORME-Standard-Shader"
 {
     Properties
     {
+        [Enum(Opaque,0,Cutout,1,Fade,2,Transparent,3)] _Mode ("Render Mode", Float) = 0
         _Color ("Color", Color) = (1,1,1,1)
         _MainTex ("Albedo (RGB)", 2D) = "white" {}
         [Toggle(_USE_NORMALMAP)] _UseNormalMap ("Use Normal Map", Float) = 1
@@ -20,7 +21,7 @@ Shader "Lilithe/ORME-Standard-Shader"
         _POMMinLayers ("POM Min Layers", Range(4,32)) = 10
         _POMMaxLayers ("POM Max Layers", Range(8,64)) = 28
         [Toggle] _UseSPOM ("Use SPOM (Silhouette POM)", Float) = 1
-        [Toggle] _UseSilhouetteClipping ("SPOM UV Silhouette Clipping", Float) = 1
+        [Toggle] _UseSilhouetteClipping ("SPOM UV Silhouette Clipping", Float) = 0
         [Toggle] _UseCurvedSilhouette ("SPOM Curved Silhouette", Float) = 1
         _HorizonSafeThreshold ("SPOM Horizon Safe Threshold", Range(0.01,1)) = 0.25
         _HorizonFalloffPower ("SPOM Horizon Falloff Power", Range(0.25,8)) = 2.0
@@ -35,10 +36,17 @@ Shader "Lilithe/ORME-Standard-Shader"
         [Toggle(_USE_TRIPLANAR)] _UseTriplanar ("Use Triplanar Mapping", Float) = 0
         _TriplanarScale ("Triplanar Scale", Float) = 1.0
         _TriplanarBlendSharpness ("Triplanar Blend Sharpness", Range(1,8)) = 4.0
+        _Cutoff ("Alpha Cutoff", Range(0,1)) = 0.5
+        _Alpha ("Alpha", Range(0,1)) = 1.0
+        [HideInInspector] _SrcBlend ("__src", Float) = 1
+        [HideInInspector] _DstBlend ("__dst", Float) = 0
+        [HideInInspector] _ZWrite ("__zw", Float) = 1
     }
     SubShader
     {
-        Tags { "RenderType"="Opaque" }
+        Tags { "RenderType"="Opaque" "Queue"="Geometry" }
+        Blend [_SrcBlend] [_DstBlend]
+        ZWrite [_ZWrite]
         LOD 200
 
         CGPROGRAM
@@ -113,6 +121,9 @@ Shader "Lilithe/ORME-Standard-Shader"
         fixed4 _EmissionColor;
         half _TriplanarScale;
         half _TriplanarBlendSharpness;
+        half _Mode;
+        half _Cutoff;
+        half _Alpha;
 
         // Add instancing support for this shader. You need to check 'Enable Instancing' on materials that use the shader.
         // See https://docs.unity3d.com/Manual/GPUInstancing.html for more information about instancing.
@@ -166,6 +177,15 @@ Shader "Lilithe/ORME-Standard-Shader"
                 * step(uv.x, rectMax.x)
                 * step(uv.y, rectMax.y);
         }
+
+            half ORME_IsRectFull01(float4 rect)
+            {
+                const half eps = 1e-4h;
+                return step(abs(rect.x - 0.0h), eps)
+                * step(abs(rect.y - 0.0h), eps)
+                * step(abs(rect.z - 1.0h), eps)
+                * step(abs(rect.w - 1.0h), eps);
+            }
 
         half SampleHeightMap(float2 uv, float4 sampleRect)
         {
@@ -288,6 +308,8 @@ Shader "Lilithe/ORME-Standard-Shader"
             fixed4 c;
             fixed4 orme;
             half parallaxVisibility = 1.0h;
+            half parallaxClipEnabled = 0.0h;
+            float3 worldViewDir = normalize(UnityWorldSpaceViewDir(IN.worldPos));
 
             #if defined(_USE_TRIPLANAR)
                 // Triplanar mapping: project textures from all three world-space axes
@@ -301,6 +323,22 @@ Shader "Lilithe/ORME-Standard-Shader"
                 // Blend weights: sharper exponent = harder transitions between axes.
                      half3 triWeights = max(pow(abs(worldN), _TriplanarBlendSharpness), 1e-4h);
                  triWeights /= (triWeights.x + triWeights.y + triWeights.z);
+
+                #if defined(_USE_HEIGHTMAP) && (ORME_LOW_TIER_GLES == 0) && (ORME_DISABLE_POM == 0)
+                {
+                    // Per-axis POM keeps each projection in its own UV space, avoiding
+                    // edge and corner artifacts from cross-axis offset reuse.
+                    float4 triSampleRect = float4(0.0, 0.0, 1.0, 1.0);
+
+                    float3 viewDirTSX = float3(-worldViewDir.z, -worldViewDir.y, abs(worldViewDir.x));
+                    float3 viewDirTSY = float3(-worldViewDir.x, -worldViewDir.z, abs(worldViewDir.y));
+                    float3 viewDirTSZ = float3(-worldViewDir.x, -worldViewDir.y, abs(worldViewDir.z));
+
+                    triUVX += ComputePOMOffset(triUVX, viewDirTSX, _Parallax, triSampleRect);
+                    triUVY += ComputePOMOffset(triUVY, viewDirTSY, _Parallax, triSampleRect);
+                    triUVZ += ComputePOMOffset(triUVZ, viewDirTSZ, _Parallax, triSampleRect);
+                }
+                #endif
 
                 // Albedo
                      c  = tex2D(_MainTex, triUVX) * triWeights.x
@@ -344,12 +382,13 @@ Shader "Lilithe/ORME-Standard-Shader"
                                 IN.uv_ParallaxMap,
                                 viewDirTS,
                                 IN.worldNormal,
-                                (_WorldSpaceCameraPos.xyz - IN.worldPos),
+                                worldViewDir,
                                 _Parallax,
                                 sampleRect,
                                 parallaxOffset,
                                 spomVisibility);
                             parallaxVisibility *= spomVisibility;
+                            parallaxClipEnabled = 1.0h;
                         }
                         else
                         {
@@ -369,9 +408,13 @@ Shader "Lilithe/ORME-Standard-Shader"
 
                 if (hasParallax > 0.5h)
                 {
-                    // Discard displaced fragments that leave the intended atlas island.
-                    parallaxVisibility *= ORME_IsUVInsideRectInset(uvMainBase, sampleRect, _MainTex_TexelSize.xy)
-                        * ORME_IsUVInsideRectInset(uvORMEBase, sampleRect, _ORMEMap_TexelSize.xy);
+                    // Only enforce atlas island clipping when an actual sub-rect is used.
+                    if (ORME_IsRectFull01(sampleRect) < 0.5h)
+                    {
+                        parallaxVisibility *= ORME_IsUVInsideRectInset(uvMainBase, sampleRect, _MainTex_TexelSize.xy)
+                            * ORME_IsUVInsideRectInset(uvORMEBase, sampleRect, _ORMEMap_TexelSize.xy);
+                        parallaxClipEnabled = 1.0h;
+                    }
                 }
 
                 float2 uvMain   = ORME_ClampUVToRectInset(uvMainBase, sampleRect, _MainTex_TexelSize.xy);
@@ -406,10 +449,22 @@ Shader "Lilithe/ORME-Standard-Shader"
             half emissionIntensity = max(_EmissionColor.r, max(_EmissionColor.g, _EmissionColor.b));
             half3 emissionTint = lerp(half3(1.0h, 1.0h, 1.0h), saturate(_EmissionColor.rgb / max(emissionIntensity, 1e-4h)), 0.25h);
             o.Emission   = c.rgb * emissionMask * emissionIntensity * emissionTint;
-            o.Alpha      = c.a;
-            clip(parallaxVisibility - 0.5h);
+            half mode = floor(_Mode + 0.5h);
+            half isTransparentMode = step(1.5h, mode);
+            half alphaOut = saturate(c.a * _Alpha);
+            alphaOut = lerp(1.0h, alphaOut, isTransparentMode);
+            o.Alpha = alphaOut;
+            if (abs(mode - 1.0h) < 0.25h)
+            {
+                clip(alphaOut - _Cutoff);
+            }
+            if (parallaxClipEnabled > 0.5h)
+            {
+                clip(parallaxVisibility - 0.5h);
+            }
         }
         ENDCG
     }
+    CustomEditor "ORMEStandardShaderGUI"
     FallBack "Diffuse"
 }

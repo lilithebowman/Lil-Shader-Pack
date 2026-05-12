@@ -8,6 +8,7 @@ Shader "Lilithe/ORME-Standard-Shader"
     Properties
     {
         [Enum(Opaque,0,Cutout,1,Fade,2,Transparent,3)] _Mode ("Render Mode", Float) = 0
+        [Enum(Back,2,Front,1,None,0)] _Cull ("Culling", Float) = 2
         _Color ("Color", Color) = (1,1,1,1)
         _MainTex ("Albedo (RGB)", 2D) = "white" {}
         [Toggle(_USE_NORMALMAP)] _UseNormalMap ("Use Normal Map", Float) = 1
@@ -45,6 +46,7 @@ Shader "Lilithe/ORME-Standard-Shader"
     SubShader
     {
         Tags { "RenderType"="Opaque" "Queue"="Geometry" }
+        Cull [_Cull]
         Blend [_SrcBlend] [_DstBlend]
         ZWrite [_ZWrite]
         LOD 200

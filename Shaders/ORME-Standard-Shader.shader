@@ -21,6 +21,8 @@ Shader "Lilithe/ORME-Standard-Shader"
         _Parallax ("Height Strength", Range(0,0.1)) = 0.02
         _POMMinLayers ("POM Min Layers", Range(4,32)) = 10
         _POMMaxLayers ("POM Max Layers", Range(8,64)) = 28
+        _POMSmoothRadius ("POM Smooth Kernel Radius", Range(0,0.02)) = 0.003
+        _POMBoundaryFade ("POM UV Boundary Fade Width", Range(0,0.25)) = 0.05
         [Toggle] _UseSPOM ("Use SPOM (Silhouette POM)", Float) = 1
         [Toggle] _UseSilhouetteClipping ("SPOM UV Silhouette Clipping", Float) = 0
         [Toggle] _UseCurvedSilhouette ("SPOM Curved Silhouette", Float) = 1
@@ -37,6 +39,7 @@ Shader "Lilithe/ORME-Standard-Shader"
         [Toggle(_USE_TRIPLANAR)] _UseTriplanar ("Use Triplanar Mapping", Float) = 0
         _TriplanarScale ("Triplanar Scale", Float) = 1.0
         _TriplanarBlendSharpness ("Triplanar Blend Sharpness", Range(1,8)) = 4.0
+        _GrazingFadeThreshold ("Grazing Fade Threshold", Range(0,0.5)) = 0.15
         _Cutoff ("Alpha Cutoff", Range(0,1)) = 0.5
         _Alpha ("Alpha", Range(0,1)) = 1.0
         [HideInInspector] _SrcBlend ("__src", Float) = 1
@@ -109,6 +112,8 @@ Shader "Lilithe/ORME-Standard-Shader"
         float4 _ParallaxSampleRect;
         half _POMMinLayers;
         half _POMMaxLayers;
+        half _POMSmoothRadius;
+        half _POMBoundaryFade;
         half _UseSPOM;
         half _UseSilhouetteClipping;
         half _UseCurvedSilhouette;
@@ -123,6 +128,7 @@ Shader "Lilithe/ORME-Standard-Shader"
         fixed4 _EmissionColor;
         half _TriplanarScale;
         half _TriplanarBlendSharpness;
+        half _GrazingFadeThreshold;
         half _Mode;
         half _Cutoff;
         half _Alpha;
@@ -189,11 +195,56 @@ Shader "Lilithe/ORME-Standard-Shader"
                 * step(abs(rect.w - 1.0h), eps);
             }
 
-        half SampleHeightMap(float2 uv, float4 sampleRect)
+        // Returns a [0,1] weight that fades to zero within fadeWidth UV units of any
+        // edge of rect. Multiply into heightScale before POM to kill boundary artifacts.
+        half ORME_UVBoundaryFade(float2 uv, float4 rect, half fadeWidth)
+        {
+            float2 rectMin = min(rect.xy, rect.zw);
+            float2 rectMax = max(rect.xy, rect.zw);
+            float2 distToEdge = min(uv - rectMin, rectMax - uv);
+            float2 t = saturate(distToEdge / max(fadeWidth, 1e-5));
+            return (half)min(smoothstep(0.0, 1.0, t.x), smoothstep(0.0, 1.0, t.y));
+        }
+
+        // Clamps UV to the rect edge before sampling. Used only for smooth-kernel taps
+        // where a tap can fall slightly outside; clamping gives a stable edge value
+        // without reading from an adjacent atlas tile.
+        half SampleHeightMapClamped(float2 uv, float4 sampleRect)
         {
             float2 clampedUV = ORME_ClampUVToRect(uv, sampleRect);
             half height = tex2D(_ParallaxMap, clampedUV).r;
             return lerp(height, 1.0h - height, saturate(_InvertHeightMap));
+        }
+
+        // Returns height normally when inside sampleRect, 0 when outside.
+        // Used during POM ray marching so that rays which walk off the UV island
+        // see flat ground (height 0) and stop — preventing false intersections
+        // caused by clamped reads from adjacent atlas tiles.
+        half SampleHeightMap(float2 uv, float4 sampleRect)
+        {
+            float2 rectMin = min(sampleRect.xy, sampleRect.zw);
+            float2 rectMax = max(sampleRect.xy, sampleRect.zw);
+            half inside = step(rectMin.x, uv.x) * step(rectMin.y, uv.y)
+                        * step(uv.x, rectMax.x) * step(uv.y, rectMax.y);
+            half height = tex2D(_ParallaxMap, clamp(uv, rectMin, rectMax)).r;
+            return lerp(height, 1.0h - height, saturate(_InvertHeightMap)) * inside;
+        }
+
+        // 5-tap cross kernel blur of the height map. Used at the final hit UV to
+        // soften silhouette edges without re-running the full ray march.
+        // Kernel taps use the clamped sampler so they never read outside the atlas island.
+        half SampleHeightMapSmooth(float2 uv, float4 sampleRect)
+        {
+            float r = _POMSmoothRadius;
+            [branch]
+            if (r < 1e-5)
+                return SampleHeightMapClamped(uv, sampleRect);
+            half h = SampleHeightMapClamped(uv, sampleRect);
+            h += SampleHeightMapClamped(uv + float2( r,  0.0), sampleRect);
+            h += SampleHeightMapClamped(uv + float2(-r,  0.0), sampleRect);
+            h += SampleHeightMapClamped(uv + float2( 0.0,  r), sampleRect);
+            h += SampleHeightMapClamped(uv + float2( 0.0, -r), sampleRect);
+            return h * 0.2h;
         }
 
         // POM UV ray marching in tangent space. Uses per-eye view direction, so it remains stable in stereo.
@@ -296,12 +347,12 @@ Shader "Lilithe/ORME-Standard-Shader"
                 float t = saturate(1.0 - ndotv / max(_HorizonSafeThreshold, 1e-3h));
                 float horizonFactor = pow(t, max(_HorizonFalloffPower, 1e-3h));
                 float heightThreshold = saturate(horizonFactor * saturate(_HorizonClipStrength));
-                float surfaceHeight = SampleHeightMap(hitUV, sampleRect) - _HorizonHeightBias;
-
-                if (surfaceHeight < heightThreshold)
-                {
-                    silhouetteVisibility = 0.0h;
-                }
+                // Smoothed height sample blurs texel-level noise at the silhouette edge.
+                float surfaceHeight = SampleHeightMapSmooth(hitUV, sampleRect) - _HorizonHeightBias;
+                // Soft step over a height-space range derived from the kernel radius so
+                // one property controls both spatial blur and edge transition width.
+                float smoothEdge = max(_POMSmoothRadius * 8.0, 1e-4);
+                silhouetteVisibility *= smoothstep(heightThreshold - smoothEdge, heightThreshold + smoothEdge, surfaceHeight);
             }
         }
 
@@ -336,9 +387,15 @@ Shader "Lilithe/ORME-Standard-Shader"
                     float3 viewDirTSY = float3(-worldViewDir.x, -worldViewDir.z, abs(worldViewDir.y));
                     float3 viewDirTSZ = float3(-worldViewDir.x, -worldViewDir.y, abs(worldViewDir.z));
 
-                    triUVX += ComputePOMOffset(triUVX, viewDirTSX, _Parallax, triSampleRect);
-                    triUVY += ComputePOMOffset(triUVY, viewDirTSY, _Parallax, triSampleRect);
-                    triUVZ += ComputePOMOffset(triUVZ, viewDirTSZ, _Parallax, triSampleRect);
+                    // Fade parallax to zero at grazing angles per projection axis.
+                    half grazingFadeThresh = max(_GrazingFadeThreshold, 1e-4h);
+                    half grazeFadeX = smoothstep(0.0h, grazingFadeThresh, abs(worldViewDir.x));
+                    half grazeFadeY = smoothstep(0.0h, grazingFadeThresh, abs(worldViewDir.y));
+                    half grazeFadeZ = smoothstep(0.0h, grazingFadeThresh, abs(worldViewDir.z));
+
+                    triUVX += ComputePOMOffset(triUVX, viewDirTSX, _Parallax * grazeFadeX, triSampleRect);
+                    triUVY += ComputePOMOffset(triUVY, viewDirTSY, _Parallax * grazeFadeY, triSampleRect);
+                    triUVZ += ComputePOMOffset(triUVZ, viewDirTSZ, _Parallax * grazeFadeZ, triSampleRect);
                 }
                 #endif
 
@@ -375,6 +432,11 @@ Shader "Lilithe/ORME-Standard-Shader"
 
                 #if defined(_USE_HEIGHTMAP) && (ORME_LOW_TIER_GLES == 0)
                     half3 viewDirTS = normalize(IN.viewDir);
+                    // Attenuate parallax height to zero at grazing angles (viewDirTS.z -> 0).
+                    half grazeFade = smoothstep(0.0h, max(_GrazingFadeThreshold, 1e-4h), abs(viewDirTS.z));
+                    // Attenuate parallax height to zero near UV rect boundaries.
+                    half boundaryFade = ORME_UVBoundaryFade(IN.uv_ParallaxMap, sampleRect, _POMBoundaryFade);
+                    half effectiveParallax = _Parallax * grazeFade * boundaryFade;
                     hasParallax = 1.0h;
                     #if (ORME_DISABLE_SPOM == 0)
                         if (_UseSPOM > 0.5h)
@@ -385,7 +447,7 @@ Shader "Lilithe/ORME-Standard-Shader"
                                 viewDirTS,
                                 IN.worldNormal,
                                 worldViewDir,
-                                _Parallax,
+                                effectiveParallax,
                                 sampleRect,
                                 parallaxOffset,
                                 spomVisibility);
@@ -395,11 +457,11 @@ Shader "Lilithe/ORME-Standard-Shader"
                         else
                         {
                             half heightSample = SampleHeightMap(IN.uv_ParallaxMap, sampleRect);
-                            parallaxOffset = ParallaxOffset(heightSample, _Parallax, float3(-viewDirTS.xy, viewDirTS.z));
+                            parallaxOffset = ParallaxOffset(heightSample, effectiveParallax, float3(-viewDirTS.xy, viewDirTS.z));
                         }
                     #else
                         half heightSample = SampleHeightMap(IN.uv_ParallaxMap, sampleRect);
-                        parallaxOffset = ParallaxOffset(heightSample, _Parallax, float3(-viewDirTS.xy, viewDirTS.z));
+                        parallaxOffset = ParallaxOffset(heightSample, effectiveParallax, float3(-viewDirTS.xy, viewDirTS.z));
                     #endif
                 #endif
 

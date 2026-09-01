@@ -9,7 +9,7 @@ public static class CreateOrmeMaterialsFromFolder
 {
 	private const string ShaderName = "Lilithe/ORME-Standard-Shader";
 
-	[MenuItem("Tools/Lilithe/Create ORME Materials From Selected Folder")]
+	[MenuItem("Lilithe/Create ORME Materials From Selected Folder")]
 	private static void CreateMaterialsFromSelection()
 	{
 		var selectedFolders = Selection.assetGUIDs
@@ -149,7 +149,7 @@ public static class CreateOrmeMaterialsFromFolder
 			"OK");
 	}
 
-	[MenuItem("Tools/Lilithe/Create ORME Materials From Selected Folder", true)]
+	[MenuItem("Lilithe/Create ORME Materials From Selected Folder", true)]
 	private static bool ValidateCreateMaterialsFromSelection()
 	{
 		return Selection.assetGUIDs

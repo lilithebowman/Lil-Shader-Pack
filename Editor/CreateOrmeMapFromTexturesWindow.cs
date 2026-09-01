@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using UnityEditor;
 using UnityEngine;
+using Lilithe.Tools;
 
 public sealed class CreateOrmeMapFromTexturesWindow : EditorWindow
 {
@@ -18,6 +19,11 @@ public sealed class CreateOrmeMapFromTexturesWindow : EditorWindow
 	private Texture2D _roughnessMap;
 	private Texture2D _metallicMap;
 	private Texture2D _emissionMaskMap;
+	private GameObject _bakeTargetObject;
+	private Material _bakeSourceMaterial;
+	private int _bakeResolution = 1024;
+	private int _bakeSamples = 32;
+	private float _bakeRayDistance = 0.5f;
 
 	private SourceChannel _occlusionChannel = SourceChannel.Grayscale;
 	private SourceChannel _roughnessChannel = SourceChannel.Grayscale;
@@ -26,12 +32,23 @@ public sealed class CreateOrmeMapFromTexturesWindow : EditorWindow
 
 	private bool _invertRoughness;
 
-	[MenuItem("Tools/Lilithe/Create ORME Map From Textures")]
+	[MenuItem("Lilithe/Create ORME Map From Textures")]
 	private static void OpenWindow()
 	{
 		var window = GetWindow<CreateOrmeMapFromTexturesWindow>("Create ORME Map");
 		window.minSize = new Vector2(430f, 300f);
 		window.Show();
+	}
+
+	private void OnEnable()
+	{
+		SyncSelectionDefaults();
+	}
+
+	private void OnSelectionChange()
+	{
+		SyncSelectionDefaults();
+		Repaint();
 	}
 
 	private void OnGUI()
@@ -55,6 +72,25 @@ public sealed class CreateOrmeMapFromTexturesWindow : EditorWindow
 				CreatePackedTexture();
 			}
 		}
+
+		EditorGUILayout.Space(16f);
+		EditorGUILayout.LabelField("Bake From Material Settings", EditorStyles.boldLabel);
+		EditorGUILayout.HelpBox("Bake AO from a selected mesh, then pack roughness from Smoothness, metallic from Metallic, and emission from the Emission Color field.", MessageType.Info);
+
+		_bakeTargetObject = (GameObject)EditorGUILayout.ObjectField("Target Object", _bakeTargetObject, typeof(GameObject), true);
+		_bakeSourceMaterial = (Material)EditorGUILayout.ObjectField("Source Material", _bakeSourceMaterial, typeof(Material), false);
+		_bakeResolution = EditorGUILayout.IntField("Bake Resolution", _bakeResolution);
+		_bakeResolution = Mathf.Clamp(_bakeResolution, 64, 8192);
+		_bakeSamples = EditorGUILayout.IntSlider("AO Samples", _bakeSamples, 1, 128);
+		_bakeRayDistance = EditorGUILayout.Slider("AO Ray Distance", _bakeRayDistance, 0.01f, 10f);
+
+		using (new EditorGUI.DisabledScope(!CanBakeFromMaterialSettings()))
+		{
+			if (GUILayout.Button("Bake ORME From Material Settings", GUILayout.Height(30f)))
+			{
+				BakeOrmeFromMaterialSettings();
+			}
+		}
 	}
 
 	private static void DrawInputRow(string label, ref Texture2D texture, ref SourceChannel sourceChannel)
@@ -71,6 +107,134 @@ public sealed class CreateOrmeMapFromTexturesWindow : EditorWindow
 			|| _roughnessMap != null
 			|| _metallicMap != null
 			|| _emissionMaskMap != null;
+	}
+
+	private bool CanBakeFromMaterialSettings()
+	{
+		return ResolveBakeTarget(out _, out _) && ResolveBakeMaterial(out _);
+	}
+
+	private void SyncSelectionDefaults()
+	{
+		if (_bakeTargetObject == null && Selection.activeGameObject != null)
+		{
+			_bakeTargetObject = Selection.activeGameObject;
+		}
+
+		if (_bakeSourceMaterial == null && _bakeTargetObject != null)
+		{
+			if (ResolveBakeTarget(out _, out var targetRenderer))
+			{
+				_bakeSourceMaterial = targetRenderer != null ? targetRenderer.sharedMaterial : null;
+			}
+		}
+	}
+
+	private bool ResolveBakeTarget(out GameObject targetObject, out Renderer targetRenderer)
+	{
+		targetObject = _bakeTargetObject != null ? _bakeTargetObject : Selection.activeGameObject;
+		targetRenderer = null;
+
+		if (targetObject == null)
+		{
+			return false;
+		}
+
+		targetRenderer = targetObject.GetComponent<Renderer>();
+		if (targetRenderer == null)
+		{
+			targetRenderer = targetObject.GetComponentInChildren<Renderer>();
+		}
+
+		return targetRenderer != null;
+	}
+
+	private bool ResolveBakeMaterial(out Material sourceMaterial)
+	{
+		sourceMaterial = _bakeSourceMaterial;
+		if (sourceMaterial != null)
+		{
+			return true;
+		}
+
+		if (!ResolveBakeTarget(out _, out var targetRenderer))
+		{
+			return false;
+		}
+
+		sourceMaterial = targetRenderer != null ? targetRenderer.sharedMaterial : null;
+		return sourceMaterial != null;
+	}
+
+	private void BakeOrmeFromMaterialSettings()
+	{
+		if (!ResolveBakeTarget(out var targetObject, out var targetRenderer))
+		{
+			EditorUtility.DisplayDialog("Bake ORME Map", "Select a GameObject with a Renderer that has a MeshFilter.", "OK");
+			return;
+		}
+
+		if (!ResolveBakeMaterial(out var sourceMaterial))
+		{
+			EditorUtility.DisplayDialog("Bake ORME Map", "Select a source material or assign one to the target object.", "OK");
+			return;
+		}
+
+		if (!AmbientOcclusionBaker.BakeAmbientOcclusionPixels(targetObject, targetRenderer, _bakeResolution, _bakeSamples, _bakeRayDistance, out var aoPixels, out var size, out var error))
+		{
+			EditorUtility.DisplayDialog("Bake ORME Map", error ?? "Failed to bake ambient occlusion.", "OK");
+			return;
+		}
+
+		var outputPath = EditorUtility.SaveFilePanelInProject(
+			"Save ORME Map",
+			"New_ORME",
+			"png",
+			"Choose where to save the generated ORME texture.");
+
+		if (string.IsNullOrWhiteSpace(outputPath))
+		{
+			return;
+		}
+
+		float smoothness = ReadMaterialFloat(sourceMaterial, "_Glossiness", 0.5f);
+		float roughness = 1f - Mathf.Clamp01(smoothness);
+		float metallic = Mathf.Clamp01(ReadMaterialFloat(sourceMaterial, "_Metallic", 0f));
+		Color emissionColor = ReadMaterialColor(sourceMaterial, "_EmissionColor", Color.black);
+		float emissionMask = Mathf.Clamp01(Mathf.Max(emissionColor.r, Mathf.Max(emissionColor.g, emissionColor.b)));
+
+		var outPixels = new Color32[size * size];
+		for (var i = 0; i < outPixels.Length; i++)
+		{
+			float occlusion = Mathf.Clamp01(aoPixels[i].r);
+			outPixels[i] = new Color32(
+				(FloatToByte(occlusion)),
+				(FloatToByte(roughness)),
+				(FloatToByte(metallic)),
+				(FloatToByte(emissionMask)));
+		}
+
+		var outputTexture = new Texture2D(size, size, TextureFormat.RGBA32, false, true);
+		outputTexture.SetPixels32(outPixels);
+		outputTexture.Apply(false, false);
+
+		var bytes = outputTexture.EncodeToPNG();
+		DestroyImmediate(outputTexture);
+
+		if (bytes == null || bytes.Length == 0)
+		{
+			EditorUtility.DisplayDialog("Bake ORME Map", "Failed to encode texture as PNG.", "OK");
+			return;
+		}
+
+		File.WriteAllBytes(outputPath, bytes);
+		AssetDatabase.ImportAsset(outputPath, ImportAssetOptions.ForceUpdate);
+		ConfigureImportedTexture(outputPath);
+		AssetDatabase.SaveAssets();
+		AssetDatabase.Refresh();
+
+		Selection.activeObject = AssetDatabase.LoadAssetAtPath<Texture2D>(outputPath);
+		EditorUtility.DisplayDialog("Bake ORME Map", $"Created ORME map:\n{outputPath}", "OK");
 	}
 
 	private void CreatePackedTexture()
@@ -229,5 +393,20 @@ public sealed class CreateOrmeMapFromTexturesWindow : EditorWindow
 		importer.alphaIsTransparency = false;
 		importer.mipmapEnabled = false;
 		importer.SaveAndReimport();
+	}
+
+	private static float ReadMaterialFloat(Material material, string propertyName, float fallback)
+	{
+		return material != null && material.HasProperty(propertyName) ? material.GetFloat(propertyName) : fallback;
+	}
+
+	private static Color ReadMaterialColor(Material material, string propertyName, Color fallback)
+	{
+		return material != null && material.HasProperty(propertyName) ? material.GetColor(propertyName) : fallback;
+	}
+
+	private static byte FloatToByte(float value)
+	{
+		return (byte)Mathf.RoundToInt(Mathf.Clamp01(value) * 255f);
 	}
 }

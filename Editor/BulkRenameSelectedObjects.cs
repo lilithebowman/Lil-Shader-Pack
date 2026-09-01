@@ -10,13 +10,13 @@ public sealed class BulkRenameSelectedObjects : ScriptableWizard
 	[SerializeField] private int startIndex = 1;
 	[SerializeField] private int numberPadding = 3;
 
-	[MenuItem("Tools/Lilithe/Bulk Rename Selected Objects")]
+	[MenuItem("Lilithe/Bulk Rename Selected Objects")]
 	private static void ShowWizard()
 	{
 		DisplayWizard<BulkRenameSelectedObjects>("Bulk Rename Selected Objects", "Rename");
 	}
 
-	[MenuItem("Tools/Lilithe/Bulk Rename Selected Objects", true)]
+	[MenuItem("Lilithe/Bulk Rename Selected Objects", true)]
 	private static bool ValidateShowWizard()
 	{
 		return Selection.gameObjects.Length > 0;

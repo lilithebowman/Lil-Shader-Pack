@@ -1,0 +1,77 @@
+// Custom Lightmap Baker Compute Shader
+// For VRChat Quest-optimized lighting
+#pragma kernel CSLightBake
+
+// Input textures and buffers
+RWTexture2D<float4> LightmapResult;
+StructuredBuffer<float3> LightPositions;
+StructuredBuffer<float4> LightData; // intensity, range, type, enabled
+StructuredBuffer<float3> WorldPositions;
+StructuredBuffer<float3> WorldNormals;
+
+// Scene data
+float3 AmbientColor;
+float AmbientIntensity;
+int LightCount;
+int2 TextureSize;
+
+[numthreads(8,8,1)]
+void CSLightBake (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)TextureSize.x || id.y >= (uint)TextureSize.y)
+        return;
+    
+    // Get UV coordinates
+    float2 uv = float2(id.x, id.y) / float2(TextureSize.x, TextureSize.y);
+    
+    // Sample world position and normal from buffers
+    // This would need to be properly mapped from UV to world space
+    uint sampleIndex = id.y * TextureSize.x + id.x;
+    
+    // Initialize with ambient lighting
+    float3 finalColor = AmbientColor * AmbientIntensity;
+    
+    // Simple lighting calculation (without GI bouncing)
+    for (int i = 0; i < LightCount; i++)
+    {
+        if (LightData[i].w < 0.5) continue; // Light disabled
+        
+        float3 lightPos = LightPositions[i];
+        float intensity = LightData[i].x;
+        float range = LightData[i].y;
+        float lightType = LightData[i].z;
+        
+        // Calculate lighting contribution
+        // This is a simplified version - Unity's system is much more complex
+        float3 lightContrib = CalculateLight(WorldPositions[sampleIndex], 
+                                           WorldNormals[sampleIndex], 
+                                           lightPos, intensity, range, lightType);
+        finalColor += lightContrib;
+    }
+    
+    // Write result to lightmap
+    LightmapResult[id.xy] = float4(finalColor, 1.0);
+}
+
+float3 CalculateLight(float3 worldPos, float3 normal, float3 lightPos, 
+                     float intensity, float range, float lightType)
+{
+    // Simple directional/point light calculation
+    float3 lightDir;
+    float attenuation = 1.0;
+    
+    if (lightType < 0.5) // Directional light
+    {
+        lightDir = normalize(lightPos); // lightPos is actually direction for directional
+    }
+    else // Point light
+    {
+        lightDir = normalize(lightPos - worldPos);
+        float distance = length(lightPos - worldPos);
+        attenuation = saturate(1.0 - (distance / range));
+    }
+    
+    // Lambert lighting
+    float ndotl = max(0, dot(normal, lightDir));
+    return float3(1, 1, 1) * intensity * ndotl * attenuation;
+}

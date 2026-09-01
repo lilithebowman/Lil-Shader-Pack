@@ -1,0 +1,150 @@
+// AOCompute.compute
+// Brute-force GPU AO compute shader with Hammersley sampling and Moller-Trumbore intersection.
+// Ensure this file is placed under Assets so AssetDatabase can find and compile it.
+
+#pragma kernel CSMain
+
+// Textures (read-only)
+Texture2D<float4> _UVPosTex;
+Texture2D<float4> _UVNormalTex;
+RWTexture2D<float4> _Result;
+
+// Buffers
+StructuredBuffer<float3> _Vertices;
+StructuredBuffer<int> _Indices;
+
+int _VertexCount;
+int _IndexCount;
+int _Samples;
+float _Radius;
+float _OcclusionFalloffPower;
+int _TexSize;
+
+// --- Helper functions (must be declared before CSMain) ---
+
+// Radical inverse (Van der Corput) for base 2
+float RadicalInverse_VdC(uint bits)
+{
+    bits = (bits << 16) | (bits >> 16);
+    bits = ((bits & 0x55555555u) << 1) | ((bits & 0xAAAAAAAAu) >> 1);
+    bits = ((bits & 0x33333333u) << 2) | ((bits & 0xCCCCCCCCu) >> 2);
+    bits = ((bits & 0x0F0F0F0Fu) << 4) | ((bits & 0xF0F0F0F0u) >> 4);
+    bits = ((bits & 0x00FF00FFu) << 8) | ((bits & 0xFF00FF00u) >> 8);
+    return float(bits) * 2.3283064365386963e-10; // / 2^32
+}
+
+float2 Hammersley2D(int i, int N)
+{
+    return float2(float(i) / float(N), RadicalInverse_VdC((uint)i));
+}
+
+// Moller-Trumbore ray-triangle intersection
+bool RayTriangleIntersect(float3 orig, float3 dir, float3 v0, float3 v1, float3 v2, out float t, out float u, out float v)
+{
+    float3 edge1 = v1 - v0;
+    float3 edge2 = v2 - v0;
+    float3 pvec = cross(dir, edge2);
+    float det = dot(edge1, pvec);
+    if (abs(det) < 1e-8) { t = u = v = 0; return false; }
+    float invDet = 1.0 / det;
+    float3 tvec = orig - v0;
+    u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) { t = u = v = 0; return false; }
+    float3 qvec = cross(tvec, edge1);
+    v = dot(dir, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) { t = u = v = 0; return false; }
+    t = dot(edge2, qvec) * invDet;
+    return t > 0.0;
+}
+
+float EvaluateDistanceOcclusion(float hitDistance, float radius, float epsilon, float falloffPower)
+{
+    if (radius <= epsilon) return 0.0;
+    float normalizedDistance = saturate((hitDistance - epsilon) / max(1e-6, radius - epsilon));
+    return pow(1.0 - normalizedDistance, falloffPower);
+}
+
+// --- Main kernel ---
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x;
+    int y = (int)id.y;
+    if (x >= _TexSize || y >= _TexSize) return;
+
+    float4 worldPosSample = _UVPosTex.Load(int3(x, y, 0));
+    float4 normalSample = _UVNormalTex.Load(int3(x, y, 0));
+    float3 worldPos = worldPosSample.xyz;
+    float3 normal = normalize((normalSample.xyz * 2.0) - 1.0);
+
+    if (worldPosSample.a < 0.5)
+    {
+        _Result[int2(x,y)] = float4(1,1,1,1);
+        return;
+    }
+
+    if (length(normal) < 1e-6)
+    {
+        normal = float3(0.0, 1.0, 0.0);
+    }
+
+    float occlusionSum = 0.0;
+    const float epsilon = 0.001;
+
+    // Per-sample loop using Hammersley (low-discrepancy)
+    for (int s = 0; s < _Samples; s++)
+    {
+        float2 xi = Hammersley2D(s, _Samples);
+
+        // Cosine-weighted hemisphere sample
+        float r = sqrt(xi.x);
+        float phi = 2.0 * 3.14159265359 * xi.y;
+        float xh = r * cos(phi);
+        float yh = r * sin(phi);
+        float zh = sqrt(max(0.0, 1.0 - xi.x));
+
+        // Build tangent space basis
+        float3 up = abs(normal.x) > 0.99 ? float3(0,1,0) : float3(1,0,0);
+        float3 tangent = normalize(cross(up, normal));
+        float3 bitangent = cross(normal, tangent);
+
+        float3 dir = normalize(tangent * xh + bitangent * yh + normal * zh);
+
+        // Ray origin
+        float3 origin = worldPos + normal * 0.001;
+
+        // Brute-force triangle intersection
+        float sampleOcclusion = 0.0;
+        for (int ti = 0; ti < _IndexCount; ti += 3)
+        {
+            int i0 = _Indices[ti + 0];
+            int i1 = _Indices[ti + 1];
+            int i2 = _Indices[ti + 2];
+
+            // Safety: ensure indices are in range
+            if (i0 < 0 || i0 >= _VertexCount || i1 < 0 || i1 >= _VertexCount || i2 < 0 || i2 >= _VertexCount)
+                continue;
+
+            float3 v0 = _Vertices[i0];
+            float3 v1 = _Vertices[i1];
+            float3 v2 = _Vertices[i2];
+
+            float t, u, v;
+            if (RayTriangleIntersect(origin, dir, v0, v1, v2, t, u, v))
+            {
+                if (t > 0.0005 && t < _Radius)
+                {
+                    sampleOcclusion = EvaluateDistanceOcclusion(t, _Radius, epsilon, _OcclusionFalloffPower);
+                    break;
+                }
+            }
+        }
+
+        occlusionSum += sampleOcclusion;
+    }
+
+    float occ = occlusionSum / max(1, _Samples);
+    float ao = 1.0 - occ;
+    _Result[int2(x,y)] = float4(ao, ao, ao, 1.0);
+}

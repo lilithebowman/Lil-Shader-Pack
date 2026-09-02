@@ -1,6 +1,7 @@
 using System.IO;
 using System.Collections.Generic;
 using UnityEditor;
+using UnityEditor.SceneManagement;
 using UnityEngine;
 
 namespace Lilithe.Tools
@@ -397,10 +398,133 @@ namespace Lilithe.Tools
                 return;
             }
 
-            var mesh = meshFilter.sharedMesh;
+            var mesh = EnsurePersistentEditableMeshForUnwrap(meshFilter);
+            if (mesh == null)
+            {
+                EditorUtility.DisplayDialog("Texture Painter", "Failed to prepare a writable mesh for UV unwrap.", "OK");
+                return;
+            }
+
             TextureUvUtility.GenerateUvLayout(mesh, unwrapMode);
             EditorUtility.SetDirty(mesh);
+            AssetDatabase.SaveAssets();
+            if (targetObject.scene.IsValid())
+            {
+                EditorSceneManager.MarkSceneDirty(targetObject.scene);
+            }
+
             Debug.Log("[Texture Painter] Generated UV layout for " + mesh.name + " using " + unwrapMode + ".");
+        }
+
+        private Mesh EnsurePersistentEditableMeshForUnwrap(MeshFilter meshFilter)
+        {
+            Mesh currentMesh = meshFilter.sharedMesh;
+            if (currentMesh == null)
+            {
+                return null;
+            }
+
+            if (CanEditMeshInPlace(currentMesh) && !IsMeshSharedByMultipleObjects(currentMesh, meshFilter))
+            {
+                return currentMesh;
+            }
+
+            string targetFolder = EnsureGeneratedFolderExists();
+            if (string.IsNullOrEmpty(targetFolder))
+            {
+                return null;
+            }
+
+            Mesh meshCopy = Instantiate(currentMesh);
+            meshCopy.name = currentMesh.name + "_UvUnwrapped";
+
+            string meshAssetPath = AssetDatabase.GenerateUniqueAssetPath(Path.Combine(targetFolder, meshCopy.name + ".asset"));
+            AssetDatabase.CreateAsset(meshCopy, meshAssetPath);
+
+            Undo.RecordObject(meshFilter, "Assign Unwrapped Mesh");
+            meshFilter.sharedMesh = meshCopy;
+            EditorUtility.SetDirty(meshFilter);
+
+            MeshCollider meshCollider = meshFilter.GetComponent<MeshCollider>();
+            if (meshCollider != null && meshCollider.sharedMesh == currentMesh)
+            {
+                Undo.RecordObject(meshCollider, "Assign Unwrapped Mesh");
+                meshCollider.sharedMesh = meshCopy;
+                EditorUtility.SetDirty(meshCollider);
+            }
+
+            return meshCopy;
+        }
+
+        private static bool CanEditMeshInPlace(Mesh mesh)
+        {
+            if (mesh == null)
+            {
+                return false;
+            }
+
+            string meshPath = AssetDatabase.GetAssetPath(mesh);
+            if (string.IsNullOrEmpty(meshPath))
+            {
+                return false;
+            }
+
+            if (!meshPath.EndsWith(".asset"))
+            {
+                return false;
+            }
+
+            return AssetDatabase.IsMainAsset(mesh);
+        }
+
+        private static bool IsMeshSharedByMultipleObjects(Mesh mesh, MeshFilter owner)
+        {
+            MeshFilter[] allMeshFilters = Object.FindObjectsByType<MeshFilter>(FindObjectsSortMode.None);
+            int usageCount = 0;
+            for (int i = 0; i < allMeshFilters.Length; i++)
+            {
+                MeshFilter filter = allMeshFilters[i];
+                if (filter == null || filter.sharedMesh != mesh)
+                {
+                    continue;
+                }
+
+                usageCount++;
+                if (usageCount > 1)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static string EnsureGeneratedFolderExists()
+        {
+            if (AssetDatabase.IsValidFolder(DefaultGeneratedFolder))
+            {
+                return DefaultGeneratedFolder;
+            }
+
+            string[] parts = DefaultGeneratedFolder.Split('/');
+            if (parts.Length == 0 || parts[0] != "Assets")
+            {
+                return null;
+            }
+
+            string currentPath = "Assets";
+            for (int i = 1; i < parts.Length; i++)
+            {
+                string nextPath = currentPath + "/" + parts[i];
+                if (!AssetDatabase.IsValidFolder(nextPath))
+                {
+                    AssetDatabase.CreateFolder(currentPath, parts[i]);
+                }
+
+                currentPath = nextPath;
+            }
+
+            return currentPath;
         }
 
         private void ExportUvLayoutPng()

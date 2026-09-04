@@ -55,17 +55,26 @@ half ORME_IsRectFull01(float4 rect)
 
 half ORME_UVBoundaryFade(float2 uv, float4 rect, half fadeWidth)
 {
+	if (ORME_IsRectFull01(rect) > 0.5h)
+	{
+		return 1.0h;
+	}
+
 	float2 rectMin = min(rect.xy, rect.zw);
 	float2 rectMax = max(rect.xy, rect.zw);
-	float2 distToEdge = min(uv - rectMin, rectMax - uv);
+	float2 localUV = uv;
+	float2 distToEdge = min(localUV - rectMin, rectMax - localUV);
 	float2 t = saturate(distToEdge / max(fadeWidth, 1e-5));
 	return (half)min(smoothstep(0.0, 1.0, t.x), smoothstep(0.0, 1.0, t.y));
 }
 
 half SampleHeightMapClamped(float2 uv, float4 sampleRect, sampler2D parallaxMap, half invertHeightMap)
 {
-	float2 clampedUV = ORME_ClampUVToRect(uv, sampleRect);
-	half height = tex2D(parallaxMap, clampedUV).r;
+	float2 wrappedUV = ORME_WrapUVToSTRect(uv, float2(1.0, 1.0), float2(0.0, 0.0));
+	float2 rectMin = min(sampleRect.xy, sampleRect.zw);
+	float2 rectMax = max(sampleRect.xy, sampleRect.zw);
+	float2 sampleUV = ORME_IsRectFull01(sampleRect) > 0.5h ? wrappedUV : clamp(uv, rectMin, rectMax);
+	half height = tex2D(parallaxMap, sampleUV).r;
 	return lerp(height, 1.0h - height, saturate(invertHeightMap));
 }
 
@@ -73,9 +82,11 @@ half SampleHeightMap(float2 uv, float4 sampleRect, sampler2D parallaxMap, half i
 {
 	float2 rectMin = min(sampleRect.xy, sampleRect.zw);
 	float2 rectMax = max(sampleRect.xy, sampleRect.zw);
-	half inside = step(rectMin.x, uv.x) * step(rectMin.y, uv.y)
+	float2 wrappedUV = ORME_WrapUVToSTRect(uv, float2(1.0, 1.0), float2(0.0, 0.0));
+	float2 sampleUV = ORME_IsRectFull01(sampleRect) > 0.5h ? wrappedUV : clamp(uv, rectMin, rectMax);
+	half inside = ORME_IsRectFull01(sampleRect) > 0.5h ? 1.0h : step(rectMin.x, uv.x) * step(rectMin.y, uv.y)
 				* step(uv.x, rectMax.x) * step(uv.y, rectMax.y);
-	half height = tex2D(parallaxMap, clamp(uv, rectMin, rectMax)).r;
+	half height = tex2D(parallaxMap, sampleUV).r;
 	return lerp(height, 1.0h - height, saturate(invertHeightMap)) * inside;
 }
 
@@ -112,10 +123,11 @@ float2 ComputePOMOffset(
 	float2 rayStep = (-viewDirTS.xy / max(0.05, abs(viewDirTS.z))) * heightScale;
 	float2 deltaUV = rayStep * layerDepth;
 
-	float2 currentUV = uv;
+	float2 currentUV = ORME_WrapUVToSTRect(uv, float2(1.0, 1.0), float2(0.0, 0.0));
 	float jitter = Hash12(uv * 4096.0);
 	float currentLayerDepth = jitter * layerDepth;
 	currentUV -= deltaUV * jitter;
+	currentUV = ORME_WrapUVToSTRect(currentUV, float2(1.0, 1.0), float2(0.0, 0.0));
 	float currentHeight = SampleHeightMap(currentUV, sampleRect, parallaxMap, invertHeightMap);
 
 	[loop]
@@ -125,26 +137,27 @@ float2 ComputePOMOffset(
 			break;
 
 		currentUV -= deltaUV;
+		currentUV = ORME_WrapUVToSTRect(currentUV, float2(1.0, 1.0), float2(0.0, 0.0));
 		currentLayerDepth += layerDepth;
 		currentHeight = SampleHeightMap(currentUV, sampleRect, parallaxMap, invertHeightMap);
 	}
 
-	float2 prevUV = currentUV + deltaUV;
+	float2 prevUV = ORME_WrapUVToSTRect(currentUV + deltaUV, float2(1.0, 1.0), float2(0.0, 0.0));
 	float prevLayerDepth = currentLayerDepth - layerDepth;
 	float prevHeight = SampleHeightMap(prevUV, sampleRect, parallaxMap, invertHeightMap);
 
-	float2 aboveUV = prevUV;
+	float2 aboveUV = ORME_WrapUVToSTRect(prevUV, float2(1.0, 1.0), float2(0.0, 0.0));
 	float aboveLayerDepth = prevLayerDepth;
 	float aboveHeight = prevHeight;
 
-	float2 belowUV = currentUV;
+	float2 belowUV = ORME_WrapUVToSTRect(currentUV, float2(1.0, 1.0), float2(0.0, 0.0));
 	float belowLayerDepth = currentLayerDepth;
 	float belowHeight = currentHeight;
 
 	[unroll]
 	for (int refine = 0; refine < 3; ++refine)
 	{
-		float2 midUV = (aboveUV + belowUV) * 0.5;
+		float2 midUV = ORME_WrapUVToSTRect((aboveUV + belowUV) * 0.5, float2(1.0, 1.0), float2(0.0, 0.0));
 		float midLayerDepth = (aboveLayerDepth + belowLayerDepth) * 0.5;
 		float midHeight = SampleHeightMap(midUV, sampleRect, parallaxMap, invertHeightMap);
 
@@ -184,6 +197,7 @@ void ComputeSPOMOffsetAndVisibility(
 	half horizonClipStrength,
 	half horizonHeightBias,
 	half pomSmoothRadius,
+	half pomBoundaryFade,
 	float minLayers,
 	float maxLayers,
 	sampler2D parallaxMap,
@@ -195,6 +209,9 @@ void ComputeSPOMOffsetAndVisibility(
 	float2 hitUV = uv + ComputePOMOffset(uv, viewDirTS, heightScale, sampleRect, minLayers, maxLayers, parallaxMap, invertHeightMap);
 	parallaxOffset = hitUV - uv;
 	silhouetteVisibility = 1.0h;
+
+	half seamFade = min(ORME_UVBoundaryFade(uv, sampleRect, pomBoundaryFade), ORME_UVBoundaryFade(hitUV, sampleRect, pomBoundaryFade));
+	silhouetteVisibility *= seamFade;
 
 	if (useSilhouetteClipping > 0.5h)
 	{

@@ -12,10 +12,8 @@ Shader "Lilithe/ORME-Standard-Shader"
         _Color ("Color", Color) = (1,1,1,1)
         _MainTex ("Albedo (RGB)", 2D) = "white" {}
         _DiffuseSaturation ("Diffuse Saturation", Range(0,2)) = 1.0
-        [Toggle(_USE_NORMALMAP)] _UseNormalMap ("Use Normal Map", Float) = 1
         [Normal] _BumpMap ("Normal Map", 2D) = "bump" {}
         _BumpScale ("Normal Strength", Range(0,2)) = 1.0
-        [Toggle(_USE_HEIGHTMAP)] _UseHeightMap ("Use Height Map", Float) = 0
         _ParallaxMap ("Height Map", 2D) = "black" {}
         [Toggle] _InvertHeightMap ("Invert Height Map", Float) = 0
         _ParallaxSampleRect ("Height Sample Rect (MinX,MinY,MaxX,MaxY)", Vector) = (0,0,1,1)
@@ -179,9 +177,9 @@ Shader "Lilithe/ORME-Standard-Shader"
                     half grazeFadeY = smoothstep(0.0h, grazingFadeThresh, abs(worldViewDir.y));
                     half grazeFadeZ = smoothstep(0.0h, grazingFadeThresh, abs(worldViewDir.z));
 
-                    triUVX += ComputePOMOffset(triUVX, viewDirTSX, _Parallax * grazeFadeX, triSampleRect, _POMMinLayers, _POMMaxLayers, _ParallaxMap, _InvertHeightMap);
-                    triUVY += ComputePOMOffset(triUVY, viewDirTSY, _Parallax * grazeFadeY, triSampleRect, _POMMinLayers, _POMMaxLayers, _ParallaxMap, _InvertHeightMap);
-                    triUVZ += ComputePOMOffset(triUVZ, viewDirTSZ, _Parallax * grazeFadeZ, triSampleRect, _POMMinLayers, _POMMaxLayers, _ParallaxMap, _InvertHeightMap);
+                    triUVX = ORME_WrapUVToSTRect(triUVX + ComputePOMOffset(triUVX, viewDirTSX, -_Parallax * grazeFadeX, triSampleRect, _POMMinLayers, _POMMaxLayers, _ParallaxMap, _InvertHeightMap), float2(1.0, 1.0), float2(0.0, 0.0));
+                    triUVY = ORME_WrapUVToSTRect(triUVY + ComputePOMOffset(triUVY, viewDirTSY, -_Parallax * grazeFadeY, triSampleRect, _POMMinLayers, _POMMaxLayers, _ParallaxMap, _InvertHeightMap), float2(1.0, 1.0), float2(0.0, 0.0));
+                    triUVZ = ORME_WrapUVToSTRect(triUVZ + ComputePOMOffset(triUVZ, viewDirTSZ, -_Parallax * grazeFadeZ, triSampleRect, _POMMinLayers, _POMMaxLayers, _ParallaxMap, _InvertHeightMap), float2(1.0, 1.0), float2(0.0, 0.0));
                 }
                 #endif
 
@@ -214,7 +212,7 @@ Shader "Lilithe/ORME-Standard-Shader"
                     half grazeFade = smoothstep(0.0h, max(_GrazingFadeThreshold, 1e-4h), abs(viewDirTS.z));
                     // Attenuate parallax height to zero near UV rect boundaries.
                     half boundaryFade = ORME_UVBoundaryFade(IN.uv_ParallaxMap, sampleRect, _POMBoundaryFade);
-                    half effectiveParallax = _Parallax * grazeFade * boundaryFade;
+                    half effectiveParallax = -_Parallax * grazeFade * boundaryFade;
                     hasParallax = 1.0h;
                     #if (ORME_DISABLE_SPOM == 0)
                         if (_UseSPOM > 0.5h)
@@ -234,6 +232,7 @@ Shader "Lilithe/ORME-Standard-Shader"
                                 _HorizonClipStrength,
                                 _HorizonHeightBias,
                                 _POMSmoothRadius,
+                                _POMBoundaryFade,
                                 _POMMinLayers,
                                 _POMMaxLayers,
                                 _ParallaxMap,

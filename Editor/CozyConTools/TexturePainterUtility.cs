@@ -474,6 +474,82 @@ namespace Lilithe.Tools
             return false;
         }
 
+        public static bool TryBuildTriangleUvIslandMap(
+            GameObject targetObject,
+            Renderer renderer,
+            out int[] triangleIslandIds)
+        {
+            triangleIslandIds = null;
+            if (targetObject == null || renderer == null)
+            {
+                return false;
+            }
+
+            MeshFilter filter = renderer.GetComponent<MeshFilter>();
+            if (filter == null || filter.sharedMesh == null)
+            {
+                return false;
+            }
+
+            Mesh mesh = filter.sharedMesh;
+            int[] triangles = mesh.triangles;
+            if (triangles == null || triangles.Length < 3)
+            {
+                return false;
+            }
+
+            int triangleCount = triangles.Length / 3;
+            triangleIslandIds = new int[triangleCount];
+            for (int i = 0; i < triangleIslandIds.Length; i++)
+            {
+                triangleIslandIds[i] = -1;
+            }
+
+            var vertexToTriangles = new Dictionary<int, List<int>>();
+            for (int tri = 0; tri < triangleCount; tri++)
+            {
+                int triBase = tri * 3;
+                int aIndex = triangles[triBase];
+                int bIndex = triangles[triBase + 1];
+                int cIndex = triangles[triBase + 2];
+
+                AddTriangleForVertex(vertexToTriangles, aIndex, tri);
+                AddTriangleForVertex(vertexToTriangles, bIndex, tri);
+                AddTriangleForVertex(vertexToTriangles, cIndex, tri);
+            }
+
+            int islandId = 0;
+            var queue = new Queue<int>();
+
+            for (int start = 0; start < triangleCount; start++)
+            {
+                if (triangleIslandIds[start] >= 0)
+                {
+                    continue;
+                }
+
+                triangleIslandIds[start] = islandId;
+                queue.Enqueue(start);
+
+                while (queue.Count > 0)
+                {
+                    int current = queue.Dequeue();
+                    int currentBase = current * 3;
+                    int aIndex = triangles[currentBase];
+                    int bIndex = triangles[currentBase + 1];
+                    int cIndex = triangles[currentBase + 2];
+
+                    FloodNeighborTriangles(vertexToTriangles, triangleIslandIds, islandId, aIndex, queue);
+                    FloodNeighborTriangles(vertexToTriangles, triangleIslandIds, islandId, bIndex, queue);
+                    FloodNeighborTriangles(vertexToTriangles, triangleIslandIds, islandId, cIndex, queue);
+                }
+
+                islandId++;
+            }
+
+            return true;
+        }
+
         public static bool PaintTexturePixelsUvBrush(
             Color[] pixels,
             int width,
@@ -697,6 +773,47 @@ namespace Lilithe.Tools
         private static float SignedArea2D(Vector2 p1, Vector2 p2, Vector2 p3)
         {
             return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+        }
+
+        private static void AddTriangleForVertex(Dictionary<int, List<int>> vertexToTriangles, int vertexIndex, int triangleIndex)
+        {
+            if (!vertexToTriangles.TryGetValue(vertexIndex, out List<int> attachedTriangles))
+            {
+                attachedTriangles = new List<int>();
+                vertexToTriangles[vertexIndex] = attachedTriangles;
+            }
+
+            attachedTriangles.Add(triangleIndex);
+        }
+
+        private static void FloodNeighborTriangles(
+            Dictionary<int, List<int>> vertexToTriangles,
+            int[] triangleIslandIds,
+            int islandId,
+            int vertexIndex,
+            Queue<int> queue)
+        {
+            if (!vertexToTriangles.TryGetValue(vertexIndex, out List<int> neighbors))
+            {
+                return;
+            }
+
+            for (int i = 0; i < neighbors.Count; i++)
+            {
+                int neighborTri = neighbors[i];
+                if (neighborTri < 0 || neighborTri >= triangleIslandIds.Length)
+                {
+                    continue;
+                }
+
+                if (triangleIslandIds[neighborTri] >= 0)
+                {
+                    continue;
+                }
+
+                triangleIslandIds[neighborTri] = islandId;
+                queue.Enqueue(neighborTri);
+            }
         }
 
         private static Vector3 Barycentric(Vector2 p, Vector2 a, Vector2 b, Vector2 c)

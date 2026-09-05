@@ -18,6 +18,8 @@ namespace Lilithe.Tools
         private const int DefaultTextureSize = 1024;
         private const int PaletteCapacity = 10;
         private const int TextureHistoryCapacity = 10;
+        private const double QuickSaveIntervalSeconds = 5.0d;
+        private const string QuickSaveSuffix = "_quickcopy";
 
         private GameObject targetObject;
         private Renderer targetRenderer;
@@ -36,18 +38,25 @@ namespace Lilithe.Tools
         private bool isPreviewPainting;
         private bool hasLastPaintUv;
         private Vector2 lastPaintUv;
+        private bool hasLastPaintTriangleIndex;
+        private int lastPaintTriangleIndex = -1;
         private Vector2 scrollPosition;
         private int cachedFaceTriangleIndex = -1;
         private float cachedMetricM00;
         private float cachedMetricM01;
         private float cachedMetricM11;
         private bool hasCachedFaceMetric;
+        private Mesh cachedUvIslandMesh;
+        private int[] cachedUvIslandIds;
         private readonly List<Color> recentPaletteColors = new List<Color>(PaletteCapacity);
         private readonly List<Color32[]> textureUndoHistory = new List<Color32[]>();
         private readonly List<Color32[]> textureRedoHistory = new List<Color32[]>();
         private Texture2D historyTexture;
         private int historyTextureWidth;
         private int historyTextureHeight;
+        private Texture2D quickSaveTexture;
+        private bool hasPendingQuickSave;
+        private double nextQuickSaveTime;
 
         [MenuItem("Lilithe/Texture Painter")]
         public static void ShowWindow()
@@ -65,11 +74,19 @@ namespace Lilithe.Tools
             }
 
             SceneView.duringSceneGui += OnSceneGUI;
+            EditorApplication.update += OnEditorUpdate;
         }
 
         private void OnDisable()
         {
             SceneView.duringSceneGui -= OnSceneGUI;
+            EditorApplication.update -= OnEditorUpdate;
+            hasPendingQuickSave = false;
+        }
+
+        private void OnEditorUpdate()
+        {
+            TryWriteQuickSaveCopyIfDue();
         }
 
         private void OnSelectionChange()
@@ -275,12 +292,20 @@ namespace Lilithe.Tools
                 targetRenderer = null;
                 targetMaterial = null;
                 activeTexture = null;
+                quickSaveTexture = null;
+                hasPendingQuickSave = false;
                 return;
             }
 
             targetRenderer = targetObject.GetComponent<Renderer>();
             targetMaterial = targetRenderer != null ? targetRenderer.sharedMaterial : null;
             activeTexture = GetCurrentTextureForMode();
+            if (quickSaveTexture != activeTexture)
+            {
+                quickSaveTexture = activeTexture;
+                hasPendingQuickSave = false;
+                nextQuickSaveTime = 0d;
+            }
         }
 
         private Texture2D GetCurrentTextureForMode()
@@ -633,6 +658,8 @@ namespace Lilithe.Tools
             {
                 isPainting = true;
                 hasLastPaintUv = false;
+                hasLastPaintTriangleIndex = false;
+                lastPaintTriangleIndex = -1;
                 hasCachedFaceMetric = false;
                 e.Use();
 
@@ -658,6 +685,8 @@ namespace Lilithe.Tools
             {
                 isPainting = false;
                 hasLastPaintUv = false;
+                hasLastPaintTriangleIndex = false;
+                lastPaintTriangleIndex = -1;
                 hasCachedFaceMetric = false;
                 cachedFaceTriangleIndex = -1;
                 e.Use();
@@ -695,8 +724,144 @@ namespace Lilithe.Tools
                 return false;
             }
 
+            if (TryGetUvAndTriangleFromHit(ray, hit, out uv, out triangleIndex))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool TryGetUvAndTriangleFromHit(Ray worldRay, RaycastHit hit, out Vector2 uv, out int triangleIndex)
+        {
             uv = hit.textureCoord;
             triangleIndex = hit.triangleIndex;
+
+            if (triangleIndex >= 0)
+            {
+                return true;
+            }
+
+            MeshFilter filter = targetRenderer != null ? targetRenderer.GetComponent<MeshFilter>() : null;
+            Mesh mesh = filter != null ? filter.sharedMesh : null;
+            if (mesh == null)
+            {
+                return false;
+            }
+
+            Vector3[] vertices = mesh.vertices;
+            Vector2[] uvs = mesh.uv;
+            int[] triangles = mesh.triangles;
+            if (vertices == null || uvs == null || triangles == null || vertices.Length == 0 || uvs.Length == 0 || triangles.Length < 3)
+            {
+                return false;
+            }
+
+            Transform meshTransform = targetRenderer.transform;
+            Ray localRay = new Ray(
+                meshTransform.InverseTransformPoint(worldRay.origin),
+                meshTransform.InverseTransformDirection(worldRay.direction));
+
+            if (!TryRaycastMeshLocal(localRay, vertices, uvs, triangles, out triangleIndex, out uv))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryRaycastMeshLocal(
+            Ray localRay,
+            Vector3[] vertices,
+            Vector2[] uvs,
+            int[] triangles,
+            out int triangleIndex,
+            out Vector2 uv)
+        {
+            triangleIndex = -1;
+            uv = Vector2.zero;
+
+            float bestDistance = float.PositiveInfinity;
+            bool hitAny = false;
+
+            for (int triBase = 0; triBase + 2 < triangles.Length; triBase += 3)
+            {
+                int aIndex = triangles[triBase];
+                int bIndex = triangles[triBase + 1];
+                int cIndex = triangles[triBase + 2];
+                if (aIndex < 0 || bIndex < 0 || cIndex < 0 || aIndex >= vertices.Length || bIndex >= vertices.Length || cIndex >= vertices.Length)
+                {
+                    continue;
+                }
+
+                if (aIndex >= uvs.Length || bIndex >= uvs.Length || cIndex >= uvs.Length)
+                {
+                    continue;
+                }
+
+                if (!TryIntersectRayTriangle(localRay, vertices[aIndex], vertices[bIndex], vertices[cIndex], out float distance, out Vector3 barycentric))
+                {
+                    continue;
+                }
+
+                if (distance >= bestDistance)
+                {
+                    continue;
+                }
+
+                bestDistance = distance;
+                triangleIndex = triBase / 3;
+                uv = uvs[aIndex] * barycentric.x + uvs[bIndex] * barycentric.y + uvs[cIndex] * barycentric.z;
+                hitAny = true;
+            }
+
+            return hitAny;
+        }
+
+        private static bool TryIntersectRayTriangle(
+            Ray ray,
+            Vector3 v0,
+            Vector3 v1,
+            Vector3 v2,
+            out float distance,
+            out Vector3 barycentric)
+        {
+            const float epsilon = 0.000001f;
+            distance = 0f;
+            barycentric = Vector3.zero;
+
+            Vector3 edge1 = v1 - v0;
+            Vector3 edge2 = v2 - v0;
+            Vector3 pVec = Vector3.Cross(ray.direction, edge2);
+            float det = Vector3.Dot(edge1, pVec);
+            if (Mathf.Abs(det) < epsilon)
+            {
+                return false;
+            }
+
+            float invDet = 1f / det;
+            Vector3 tVec = ray.origin - v0;
+            float u = Vector3.Dot(tVec, pVec) * invDet;
+            if (u < 0f || u > 1f)
+            {
+                return false;
+            }
+
+            Vector3 qVec = Vector3.Cross(tVec, edge1);
+            float v = Vector3.Dot(ray.direction, qVec) * invDet;
+            if (v < 0f || u + v > 1f)
+            {
+                return false;
+            }
+
+            float t = Vector3.Dot(edge2, qVec) * invDet;
+            if (t < 0f)
+            {
+                return false;
+            }
+
+            distance = t;
+            barycentric = new Vector3(1f - u - v, u, v);
             return true;
         }
 
@@ -718,15 +883,21 @@ namespace Lilithe.Tools
                 return;
             }
 
-            if (!TryGetOrUpdateFaceMetric(uv, triangleIndexHint, out float m00, out float m01, out float m11))
+            if (!TryGetOrUpdateFaceMetric(uv, triangleIndexHint, out int resolvedTriangleIndex, out float m00, out float m01, out float m11))
             {
                 return;
             }
 
             Color[] pixels = activeTexture.GetPixels();
             bool changed = false;
+            bool canInterpolate =
+                interpolateFromLast &&
+                hasLastPaintUv &&
+                hasLastPaintTriangleIndex &&
+                resolvedTriangleIndex >= 0 &&
+                AreTrianglesInSameUvIsland(lastPaintTriangleIndex, resolvedTriangleIndex);
 
-            if (interpolateFromLast && hasLastPaintUv)
+            if (canInterpolate)
             {
                 float uvRadius = TexturePainterUtility.EstimateUvRadiusFromMetric(brushRadius, m00, m11);
                 float spacing = Mathf.Max(0.0005f, uvRadius * 0.35f);
@@ -770,11 +941,13 @@ namespace Lilithe.Tools
             {
                 activeTexture.SetPixels(pixels);
                 activeTexture.Apply();
-                EditorUtility.SetDirty(activeTexture);
+                MarkTextureDirtyAndQueueQuickSave();
             }
 
             lastPaintUv = uv;
             hasLastPaintUv = true;
+            lastPaintTriangleIndex = resolvedTriangleIndex;
+            hasLastPaintTriangleIndex = resolvedTriangleIndex >= 0;
             Repaint();
         }
 
@@ -795,6 +968,8 @@ namespace Lilithe.Tools
             {
                 isPreviewPainting = true;
                 hasLastPaintUv = false;
+                hasLastPaintTriangleIndex = false;
+                lastPaintTriangleIndex = -1;
                 hasCachedFaceMetric = false;
                 CaptureTextureUndoSnapshot();
                 PaintPreviewAtMouse(previewRect, e.mousePosition);
@@ -813,6 +988,8 @@ namespace Lilithe.Tools
             {
                 isPreviewPainting = false;
                 hasLastPaintUv = false;
+                hasLastPaintTriangleIndex = false;
+                lastPaintTriangleIndex = -1;
                 hasCachedFaceMetric = false;
                 cachedFaceTriangleIndex = -1;
                 e.Use();
@@ -840,8 +1017,9 @@ namespace Lilithe.Tools
             Repaint();
         }
 
-        private bool TryGetOrUpdateFaceMetric(Vector2 uv, int triangleIndexHint, out float m00, out float m01, out float m11)
+        private bool TryGetOrUpdateFaceMetric(Vector2 uv, int triangleIndexHint, out int resolvedTriangleIndex, out float m00, out float m01, out float m11)
         {
+            resolvedTriangleIndex = -1;
             m00 = 0f;
             m01 = 0f;
             m11 = 0f;
@@ -854,6 +1032,8 @@ namespace Lilithe.Tools
                     return false;
                 }
             }
+
+            resolvedTriangleIndex = triangleIndex;
 
             if (hasCachedFaceMetric && triangleIndex == cachedFaceTriangleIndex)
             {
@@ -874,6 +1054,43 @@ namespace Lilithe.Tools
             cachedMetricM11 = m11;
             hasCachedFaceMetric = true;
             return true;
+        }
+
+        private bool AreTrianglesInSameUvIsland(int firstTriangleIndex, int secondTriangleIndex)
+        {
+            if (firstTriangleIndex < 0 || secondTriangleIndex < 0)
+            {
+                return false;
+            }
+
+            MeshFilter filter = targetRenderer != null ? targetRenderer.GetComponent<MeshFilter>() : null;
+            Mesh mesh = filter != null ? filter.sharedMesh : null;
+            if (mesh == null)
+            {
+                return false;
+            }
+
+            if (cachedUvIslandMesh != mesh || cachedUvIslandIds == null)
+            {
+                if (!TexturePainterUtility.TryBuildTriangleUvIslandMap(targetObject, targetRenderer, out cachedUvIslandIds))
+                {
+                    return false;
+                }
+
+                cachedUvIslandMesh = mesh;
+            }
+
+            if (cachedUvIslandIds == null)
+            {
+                return false;
+            }
+
+            if (firstTriangleIndex >= cachedUvIslandIds.Length || secondTriangleIndex >= cachedUvIslandIds.Length)
+            {
+                return false;
+            }
+
+            return cachedUvIslandIds[firstTriangleIndex] == cachedUvIslandIds[secondTriangleIndex];
         }
 
         private Rect DrawUvOverlayPreview(Texture2D texture)
@@ -1125,6 +1342,94 @@ namespace Lilithe.Tools
             EditorUtility.SetDirty(activeTexture);
             Repaint();
             SceneView.RepaintAll();
+        }
+
+        private void MarkTextureDirtyAndQueueQuickSave()
+        {
+            if (activeTexture == null)
+            {
+                return;
+            }
+
+            if (!EditorUtility.IsDirty(activeTexture))
+            {
+                EditorUtility.SetDirty(activeTexture);
+            }
+
+            if (quickSaveTexture != activeTexture)
+            {
+                quickSaveTexture = activeTexture;
+                nextQuickSaveTime = 0d;
+            }
+
+            hasPendingQuickSave = true;
+            TryWriteQuickSaveCopyIfDue();
+        }
+
+        private void TryWriteQuickSaveCopyIfDue()
+        {
+            if (!hasPendingQuickSave || activeTexture == null || quickSaveTexture != activeTexture)
+            {
+                return;
+            }
+
+            double now = EditorApplication.timeSinceStartup;
+            if (now < nextQuickSaveTime)
+            {
+                return;
+            }
+
+            if (!TexturePainterUtility.EnsureTextureReadable(activeTexture))
+            {
+                return;
+            }
+
+            if (!TryGetQuickSavePaths(activeTexture, out string quickAssetPath, out string quickAbsolutePath))
+            {
+                return;
+            }
+
+            try
+            {
+                byte[] bytes = activeTexture.EncodeToPNG();
+                File.WriteAllBytes(quickAbsolutePath, bytes);
+                AssetDatabase.ImportAsset(quickAssetPath, ImportAssetOptions.ForceUpdate);
+                hasPendingQuickSave = false;
+                nextQuickSaveTime = now + QuickSaveIntervalSeconds;
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning("[Texture Painter] Failed to write quick-save texture copy: " + ex.Message);
+            }
+        }
+
+        private static bool TryGetQuickSavePaths(Texture2D texture, out string quickAssetPath, out string quickAbsolutePath)
+        {
+            quickAssetPath = null;
+            quickAbsolutePath = null;
+
+            if (texture == null)
+            {
+                return false;
+            }
+
+            string assetPath = AssetDatabase.GetAssetPath(texture);
+            if (string.IsNullOrEmpty(assetPath) || !assetPath.EndsWith(".png", System.StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            string directory = Path.GetDirectoryName(assetPath);
+            string fileName = Path.GetFileNameWithoutExtension(assetPath);
+            if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(fileName))
+            {
+                return false;
+            }
+
+            quickAssetPath = Path.Combine(directory, fileName + QuickSaveSuffix + ".png").Replace('\\', '/');
+            string projectRoot = Path.GetDirectoryName(Application.dataPath);
+            quickAbsolutePath = Path.GetFullPath(Path.Combine(projectRoot, quickAssetPath));
+            return true;
         }
 
     }
